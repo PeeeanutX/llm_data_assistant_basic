@@ -1,0 +1,8 @@
+-r requirements.txt
+
+pytest>=8.0
+pytest-cov>=5.0
+pytest-postgresql>=6.0
+# pytest-postgresql imports psycopg 3 at plugin load; the binary extra bundles
+# libpq so pytest can start on machines without a local PostgreSQL install.
+psycopg[binary]>=3.1
