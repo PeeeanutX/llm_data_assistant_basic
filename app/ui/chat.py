@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
 
@@ -10,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from app.agent.explainer import StepExplainer
+from app.agent.judge import MODE_OFF, AnswerJudge, JudgeVerdict
 from app.agent.tokens import TokenBudget
 from app.agent.steps import prettify_intermediate_steps
 from app.db.repository import InteractionRecord, InteractionRepository
@@ -32,6 +35,9 @@ TREATMENT_GATED_EXPLANATION: int = 2
 # False to restore the A/B treatment behaviour.
 _DEV_FORCE_GATED: bool = True
 
+# Colour of the confidence level in the caption under an answer.
+_LEVEL_COLOURS: dict[str, str] = {"High": "green", "Medium": "orange", "Low": "red"}
+
 
 def _is_gated(treatment: int | None) -> bool:
     """Whether the explanation should be gated behind the button."""
@@ -51,7 +57,10 @@ def render_chat_history(
     gated = _is_gated(treatment)
     for message in st.session_state.get("messages", []):
         if "expander" not in message:
-            st.chat_message(message["role"]).write(message["content"])
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
+                if message.get("confidence"):
+                    st.caption(message["confidence"])
             continue
         _render_explanation_message(message, gated=gated, repository=repository)
 
@@ -94,8 +103,13 @@ def render_new_turn(
     explainer: StepExplainer,
     repository: InteractionRepository,
     token_budget: TokenBudget,
+    judge: AnswerJudge | None = None,
 ) -> None:
-    """Drive a single user/agent exchange end-to-end."""
+    """Drive a single user/agent exchange end-to-end.
+
+    ``judge`` is the LLM-as-a-judge uncertainty estimator; ``None`` means it
+    is switched off, so no confidence is shown or logged.
+    """
     user_query_sent_time = pd.Timestamp.now()
     question_id = increment_question_counter()
 
@@ -108,16 +122,32 @@ def render_new_turn(
     response_content: str = response["output"]
     response_displayed_time = pd.Timestamp.now()
 
-    _append_and_render_assistant_message(response_content)
+    answer_message, answer_container = _append_and_render_assistant_message(response_content)
     msgs.add_ai_message(response_content)
 
     inter_steps = response.get("intermediate_steps") or []
     # Only answers grounded in a database query have steps worth explaining;
     # greetings / "not related to the database" replies get no button.
     has_explanation = bool(inter_steps)
-    explanation_content, prettified_steps = _build_explanation(
-        inter_steps=inter_steps, explainer=explainer
-    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        # The judge only needs the agent's output, so it runs alongside the
+        # explainer instead of adding its latency on top.
+        judge_future = (
+            executor.submit(
+                judge.evaluate, user_query, inter_steps, response_content, truncated_history
+            )
+            if judge is not None and has_explanation
+            else None
+        )
+        explanation_content, prettified_steps = _build_explanation(
+            inter_steps=inter_steps, explainer=explainer
+        )
+        verdict = _collect_verdict(judge_future)
+
+    if verdict is not None:
+        caption = _confidence_caption(verdict)
+        answer_message["confidence"] = caption  # replayed by render_chat_history
+        answer_container.caption(caption)
 
     explanation_button_displayed_time: pd.Timestamp | None = None
     explanation_displayed_time: pd.Timestamp | None = None
@@ -161,6 +191,8 @@ def render_new_turn(
         response_displayed_time=response_displayed_time,
         explanation_button_displayed_time=explanation_button_displayed_time,
         explanation_displayed_time=explanation_displayed_time,
+        judge_mode=judge.mode if judge is not None else MODE_OFF,
+        verdict=verdict,
     )
 
 
@@ -172,9 +204,13 @@ def _append_and_render_user_message(user_query: str) -> None:
     st.chat_message("user").write(user_query)
 
 
-def _append_and_render_assistant_message(content: str) -> None:
-    st.session_state.messages.append({"role": "assistant", "content": content})
-    st.chat_message("assistant").write(content)
+def _append_and_render_assistant_message(content: str) -> tuple[dict, Any]:
+    """Show the answer; return its stored message and its chat container."""
+    message = {"role": "assistant", "content": content}
+    st.session_state.messages.append(message)
+    container = st.chat_message("assistant")
+    container.write(content)
+    return message, container
 
 
 def _invoke_agent(agent: Any, user_query: str, history: list) -> dict:
@@ -202,6 +238,26 @@ def _build_explanation(
         except Exception:
             logger.exception("Explanation generation failed")
             return NO_EXPLANATION_MESSAGE, prettified
+
+
+def _collect_verdict(judge_future: Future[JudgeVerdict] | None) -> JudgeVerdict | None:
+    """Wait for the judge; a failed judgement only costs the confidence label."""
+    if judge_future is None:
+        return None
+    with st.spinner("Estimating confidence..."):
+        try:
+            return judge_future.result()
+        except Exception:
+            logger.exception("Confidence estimation failed")
+            return None
+
+
+def _confidence_caption(verdict: JudgeVerdict) -> str:
+    colour = _LEVEL_COLOURS.get(verdict.level, "gray")
+    return (
+        f"Confidence: :{colour}[**{verdict.level}**] "
+        f"(judge score {verdict.score:.1f} / {verdict.scale_max})"
+    )
 
 
 def _render_gated_explanation(
@@ -253,7 +309,14 @@ def _persist_interaction(
     response_displayed_time: pd.Timestamp,
     explanation_button_displayed_time: pd.Timestamp | None,
     explanation_displayed_time: pd.Timestamp | None,
+    judge_mode: str,
+    verdict: JudgeVerdict | None,
 ) -> None:
+    distribution = (
+        json.dumps(verdict.distribution)
+        if verdict is not None and verdict.distribution is not None
+        else None
+    )
     record = InteractionRecord(
         session_id=get_session_id(),
         question_id=question_id,
@@ -269,6 +332,15 @@ def _persist_interaction(
         explanation_clicked_time=None,
         explanation_clicked=None,
         explanation_displayed_time=_to_pydatetime(explanation_displayed_time),
+        judge_mode=judge_mode,
+        judge_model=verdict.model if verdict else None,
+        judge_method=verdict.method if verdict else None,
+        judge_score=verdict.score if verdict else None,
+        judge_confidence=verdict.confidence if verdict else None,
+        judge_distribution=distribution,
+        judge_rationale=verdict.rationale if verdict else None,
+        judge_reference_sql=verdict.reference_sql if verdict else None,
+        judge_reference_result=verdict.reference_result if verdict else None,
     )
     try:
         repository.save(record)

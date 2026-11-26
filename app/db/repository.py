@@ -36,6 +36,17 @@ class InteractionRecord:
     explanation_clicked_time: datetime | None
     explanation_clicked: bool | None
     explanation_displayed_time: datetime | None
+    # LLM-as-a-judge uncertainty estimate. ``judge_mode`` is the configured
+    # mode ("off" included); the rest stay ``None`` when no score was produced.
+    judge_mode: str | None = None
+    judge_model: str | None = None
+    judge_method: str | None = None
+    judge_score: float | None = None
+    judge_confidence: float | None = None
+    judge_distribution: str | None = None
+    judge_rationale: str | None = None
+    judge_reference_sql: str | None = None
+    judge_reference_result: str | None = None
 
 
 # Column order used by ``INSERT``. Kept beside the SQL to keep the two in sync.
@@ -54,6 +65,15 @@ _INSERT_COLUMNS: tuple[str, ...] = (
     "explanation_clicked_time",
     "explanation_clicked",
     "explanation_displayed_time",
+    "judge_mode",
+    "judge_model",
+    "judge_method",
+    "judge_score",
+    "judge_confidence",
+    "judge_distribution",
+    "judge_rationale",
+    "judge_reference_sql",
+    "judge_reference_result",
 )
 
 
@@ -109,6 +129,15 @@ class InteractionRepository:
             record.explanation_clicked_time,
             record.explanation_clicked,
             record.explanation_displayed_time,
+            record.judge_mode,
+            record.judge_model,
+            record.judge_method,
+            record.judge_score,
+            record.judge_confidence,
+            record.judge_distribution,
+            record.judge_rationale,
+            record.judge_reference_sql,
+            record.judge_reference_result,
         )
 
     @staticmethod
