@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -54,6 +55,32 @@ class Settings(BaseSettings):
     # ---- Explainer LLM call ---------------------------------------------
     explanation_max_tokens: int = Field(default=1_000, ge=1)
     explanation_temperature: float = Field(default=0.1, ge=0.0, le=2.0)
+
+    # ---- LLM-as-a-judge (uncertainty estimator) --------------------------
+    judge_mode: Literal["off", "geval", "mtbench", "combined"] = Field(
+        default="off",
+        description=(
+            "How answers are graded: 'geval' (probability-weighted form "
+            "filling), 'mtbench' (reference-guided single-answer grading), "
+            "'combined' (both), or 'off' for no uncertainty estimate."
+        ),
+    )
+    judge_model: str | None = Field(
+        default=None,
+        description="Model used by the judge; defaults to ``openai_model``.",
+    )
+    judge_samples: int = Field(
+        default=20,
+        ge=1,
+        description="Samples drawn to estimate score probabilities without logprobs.",
+    )
+    judge_max_tokens: int = Field(default=600, ge=1)
+    judge_low_threshold: float = Field(
+        default=0.5, ge=0.0, le=1.0, description="Below this 0..1 confidence: 'Low'."
+    )
+    judge_high_threshold: float = Field(
+        default=0.75, ge=0.0, le=1.0, description="At or above this 0..1 confidence: 'High'."
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",

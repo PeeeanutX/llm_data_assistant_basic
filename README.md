@@ -8,9 +8,11 @@ the answer by looking through a sales dataset for you.
 It can also show you, step by step, *how* it found
 the answer.
 
-> This is the **basic version** of the Data Assistant. It does not include the
-> confidence-scoring ("how sure am I?") feature, so it needs no HuggingFace
-> account and none of the heavy AI libraries that feature used.
+> This is the **basic version** of the Data Assistant. It needs no HuggingFace
+> account and none of the heavy AI libraries the original confidence-scoring
+> ("how sure am I?") feature used. An optional, lightweight replacement, an
+> **LLM-as-a-judge**, is built in and switched off by default; see
+> [Confidence estimate (LLM-as-a-judge)](#confidence-estimate-llm-as-a-judge).
 
 ---
 
@@ -32,6 +34,7 @@ the answer.
   - [Project layout](#project-layout)
   - [Configuration reference](#configuration-reference)
   - [How the explanation is shown](#how-the-explanation-is-shown)
+  - [Confidence estimate (LLM-as-a-judge)](#confidence-estimate-llm-as-a-judge)
   - [Testing](#testing)
 
 ---
@@ -336,6 +339,8 @@ side by side (see `compose.yaml`).
 OpenAI's LLM is a paid service — you pay OpenAI a small amount each time the
 assistant answers a question. Each data question uses two AI calls: one for
 the SQL agent (which may take a few steps) and one to write the explanation.
+Turning on the confidence estimate (`JUDGE_MODE`) adds one more call per data
+question in `geval` mode and two more in `mtbench` and `combined` mode.
 
 Neon is free for this kind of light use.
 
@@ -383,7 +388,8 @@ The rest of this document is for developers and researchers working on the code.
     │   ├── factory.py          LangChain SQL agent (create_sql_agent)
     │   ├── tokens.py           Token counting + history truncation
     │   ├── steps.py            Prettifies intermediate agent steps
-    │   └── explainer.py        Second LLM pass that simplifies steps
+    │   ├── explainer.py        Second LLM pass that simplifies steps
+    │   └── judge.py            LLM-as-a-judge confidence estimate (optional)
     └── ui/
         ├── session.py          Session state and query-param parsing
         └── chat.py             Chat rendering and per-turn orchestration
@@ -393,8 +399,9 @@ The rest of this document is for developers and researchers working on the code.
 an on-disk SQLite database (one table per sheet), reopens it **read-only**, and
 hands it to a LangChain SQL agent. The agent inspects the schema, writes a SQLite
 query, runs it, and summarises the result in natural language. A second LLM pass
-turns the agent's intermediate steps into a friendly explanation. Each turn is
-persisted to PostgreSQL with timing metadata.
+turns the agent's intermediate steps into a friendly explanation. If the judge is
+enabled, a further pass grades the answer and the grade is shown as a confidence
+level. Each turn is persisted to PostgreSQL with timing metadata.
 
 ## Configuration reference
 
@@ -412,6 +419,11 @@ All settings are read from environment variables (or a `.env` file) via
 | `SQLITE_DB_PATH` | `database.db` | Where the generated SQLite warehouse is written. |
 | `MAX_TOTAL_TOKENS` / `RESERVED_TOKENS` | `14600` / `1000` | Token budget for the agent's chat history. |
 | `EXPLANATION_MAX_TOKENS` / `EXPLANATION_TEMPERATURE` | `1000` / `0.1` | Step-explainer LLM call. |
+| `JUDGE_MODE` | `off` | Confidence estimate: `off`, `geval`, `mtbench` or `combined`. |
+| `JUDGE_MODEL` | *(same as `OPENAI_MODEL`)* | Model that grades the answers. |
+| `JUDGE_SAMPLES` | `20` | Samples drawn to estimate score probabilities when the model reports none. |
+| `JUDGE_MAX_TOKENS` | `600` | Token budget for the judge's explanation and for its reference SQL. |
+| `JUDGE_LOW_THRESHOLD` / `JUDGE_HIGH_THRESHOLD` | `0.5` / `0.75` | Confidence (0–1) cut-offs for the Low / Medium / High label. |
 
 > Note: the code default for `EXCEL_FILE_PATH` points at `streamlit_agent/…`, but
 > the bundled `.env.example` points at the workbook in the project root
@@ -432,6 +444,42 @@ hidden behind a **"See explanation"** button.
   `?treatment=` URL parameter: `treatment=2` shows the button, anything else
   shows the explanation open.
 
+## Confidence estimate (LLM-as-a-judge)
+
+With `JUDGE_MODE` set to anything but `off`, `app/agent/judge.py` grades every
+answer that is grounded in a database query and the chat shows the result under
+the answer, e.g. *Confidence: High (judge score 4.6 / 5)*. Greetings and
+off-topic replies are not graded. The judge sees the question, the recent
+conversation, the database schema, the agent's SQL queries with their results,
+and the final answer.
+
+| `JUDGE_MODE` | Method | Scale | Extra LLM calls |
+|--------------|--------|-------|-----------------|
+| `off` | No judge, no confidence estimate. | – | 0 |
+| `geval` | G-Eval (Liu et al., 2023): criteria and fixed evaluation steps in the prompt; the judge replies with a score only, and the final score is the probability-weighted sum over the score tokens. | 1–5 | 1 |
+| `mtbench` | Reference-guided single-answer grading (Zheng et al., 2023): the judge model first writes and runs its own SQL for the question, then compares the assistant's answer with that reference, explains, and ends with `Rating: [[n]]`. | 1–10 | 2 |
+| `combined` | The reference and explanation of `mtbench` with the criteria and probability-weighted 1–5 score of `geval`. | 1–5 | 2 |
+
+Details worth knowing:
+
+- **Probabilities.** `geval` and `combined` read the score distribution from the
+  judge's token log-probabilities. If the model does not report them, the
+  distribution is estimated from `JUDGE_SAMPLES` completions at temperature 1
+  instead, which is slower and costs more.
+- **Reference SQL** runs on a separate read-only SQLite connection, is limited to
+  a single `SELECT`, and is aborted after 10 seconds.
+- **The label is not calibrated.** The score is rescaled to 0–1 and bucketed with
+  `JUDGE_LOW_THRESHOLD` / `JUDGE_HIGH_THRESHOLD`. It is the judge's opinion, not a
+  measured probability that the answer is correct.
+- **Failures are silent for the user.** If the judge errors out, the answer is
+  shown without a confidence label and the error is logged.
+- **Logging.** Each turn stores `judge_mode`, `judge_model`, `judge_method`
+  (`logprobs`, `sampling` or `single`), `judge_score`, `judge_confidence`,
+  `judge_distribution` (JSON), `judge_rationale`, `judge_reference_sql` and
+  `judge_reference_result`. These columns are added to an existing interactions
+  table automatically on startup. `judge_mode` is always filled in (including
+  `off`), so the modes can be compared afterwards.
+
 ## Testing
 
 ```bash
@@ -441,7 +489,8 @@ pytest -m "not db"     # pure unit tests only (no Postgres needed)
 pytest --cov=app       # with coverage
 ```
 
-Pure tests cover `tokens.py` and `steps.py`. The
+Pure tests cover `tokens.py`, `steps.py` and `judge.py` (with a fake OpenAI
+client, so no API key is needed). The
 DB-backed test (`tests/test_repository.py`, marked `db`) spins up an ephemeral
 PostgreSQL via `pytest-postgresql`, runs `initialize_schema`, and exercises the
 repository end-to-end. It skips automatically if the PostgreSQL server binaries

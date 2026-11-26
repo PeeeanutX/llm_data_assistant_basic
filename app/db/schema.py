@@ -1,8 +1,8 @@
 """Idempotent schema creation for the interactions log.
 
-Suited to a PoC: the interactions table is frozen by the experiment design,
-so a single ``initialize_schema`` call on startup is simpler than a full
-Alembic migration tree. DDL uses ``psycopg2.sql`` so identifiers are safely
+Suited to a PoC: the interactions table changes rarely and only by gaining
+nullable columns, so a single ``initialize_schema`` call on startup is simpler
+than a full Alembic migration tree. DDL uses ``psycopg2.sql`` so identifiers are safely
 quoted even though the table name is a trusted constant.
 """
 from __future__ import annotations
@@ -35,10 +35,34 @@ CREATE TABLE IF NOT EXISTS {tbl} (
 )
 """
 
+# LLM-as-a-judge columns. They are added with ``ADD COLUMN IF NOT EXISTS`` so
+# a table created before the judge existed is upgraded in place; all are
+# nullable and stay NULL when the judge is off or produced no score.
+_JUDGE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("judge_mode", "TEXT"),
+    ("judge_model", "TEXT"),
+    ("judge_method", "TEXT"),
+    ("judge_score", "DOUBLE PRECISION"),
+    ("judge_confidence", "DOUBLE PRECISION"),
+    ("judge_distribution", "TEXT"),
+    ("judge_rationale", "TEXT"),
+    ("judge_reference_sql", "TEXT"),
+    ("judge_reference_result", "TEXT"),
+)
+
+_ADD_COLUMN_SQL = "ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {type}"
+
 
 def initialize_schema(pool: PostgresPool, table_name: str) -> None:
-    """Create the interactions table if it does not exist yet."""
+    """Create the interactions table, or add any columns it is missing."""
     logger.info("Initialising schema for table %s", table_name)
+    table = sql.Identifier(table_name)
     with pool.cursor() as cur:
-        cur.execute(sql.SQL(_CREATE_TABLE_SQL).format(tbl=sql.Identifier(table_name)))
+        cur.execute(sql.SQL(_CREATE_TABLE_SQL).format(tbl=table))
+        for column, column_type in _JUDGE_COLUMNS:
+            cur.execute(
+                sql.SQL(_ADD_COLUMN_SQL).format(
+                    tbl=table, col=sql.Identifier(column), type=sql.SQL(column_type)
+                )
+            )
     logger.info("Schema for table %s is ready", table_name)

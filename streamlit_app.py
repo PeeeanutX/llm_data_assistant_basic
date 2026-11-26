@@ -14,6 +14,7 @@ import streamlit as st
 
 from app.agent.explainer import StepExplainer
 from app.agent.factory import build_sql_agent
+from app.agent.judge import AnswerJudge, build_judge
 from app.agent.tokens import TokenBudget
 from app.config import Settings, get_settings
 from app.data_loader import load_excel_to_sqlite
@@ -34,7 +35,9 @@ logger = logging.getLogger(__name__)
 
 
 @st.cache_resource(show_spinner="Initialising data assistant...")
-def _bootstrap() -> tuple[Any, InteractionRepository, StepExplainer, TokenBudget]:
+def _bootstrap() -> (
+    tuple[Any, InteractionRepository, StepExplainer, TokenBudget, AnswerJudge | None]
+):
     """Construct singletons that should survive across Streamlit reruns.
 
     ``@st.cache_resource`` guarantees this runs once per server process.
@@ -71,7 +74,20 @@ def _bootstrap() -> tuple[Any, InteractionRepository, StepExplainer, TokenBudget
         reserved_tokens=settings.reserved_tokens,
     )
 
-    return agent, repository, explainer, token_budget
+    # ``None`` when JUDGE_MODE=off: no uncertainty estimate is produced.
+    judge = build_judge(
+        mode=settings.judge_mode,
+        api_key=settings.openai_api_key.get_secret_value(),
+        model=settings.judge_model or settings.openai_model,
+        db=database,
+        sqlite_path=settings.sqlite_db_path,
+        samples=settings.judge_samples,
+        max_tokens=settings.judge_max_tokens,
+        low_threshold=settings.judge_low_threshold,
+        high_threshold=settings.judge_high_threshold,
+    )
+
+    return agent, repository, explainer, token_budget, judge
 
 
 def main() -> None:
@@ -82,7 +98,7 @@ def main() -> None:
     st.title("LLM-based Data Assistant")
 
     try:
-        agent, repository, explainer, token_budget = _bootstrap()
+        agent, repository, explainer, token_budget, judge = _bootstrap()
     except Exception as exc:
         logger.exception("Failed to initialise data assistant")
         st.error(
@@ -113,6 +129,7 @@ def main() -> None:
             explainer=explainer,
             repository=repository,
             token_budget=token_budget,
+            judge=judge,
         )
 
 
